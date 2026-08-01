@@ -70,7 +70,7 @@ tests/
   fixtures/repo.ts     A real throwaway local git repo, mirrors Drover's tests/fixtures/site.ts
 ```
 
-`src/types.ts`, `src/db/`, `src/budget.ts`, `src/providers/`, and `src/prompts/` exist so far — see `CLAUDE.md` for current build status.
+`src/types.ts`, `src/db/`, `src/budget.ts`, `src/providers/`, `src/prompts/`, `src/structural-check.ts`, `src/test-gate.ts`, and `src/loop.ts` exist so far — see `CLAUDE.md` for current build status.
 
 ## Key decisions (do not re-litigate)
 
