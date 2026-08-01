@@ -30,6 +30,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "better-sqlite3": "^13.0.2"
   },
   "devDependencies": {

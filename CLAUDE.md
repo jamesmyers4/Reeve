@@ -8,9 +8,11 @@ Reeve is a Sonnet-supervised qwen task-execution loop: `qwen2.5:3b` (via Ollama)
 
 ## Build status
 
-**Session 1 — done** (2026-08-01): repo scaffold, core types, SQLite schema + migration runner. No LLM calls, $0 cost. See below for what exists and the judgment calls made.
+**Session 1 — done** (2026-08-01): repo scaffold, core types, SQLite schema + migration runner. No LLM calls, $0 cost.
 
-**Not yet built:** everything from Session 2 onward — the provider layer (Ollama executor, Anthropic task-author/reviewer), the core loop, git/PR integration, the GitHub Actions workflow, and the real end-to-end dry run. See "Remaining sessions" below for the full plan.
+**Session 2 — done** (2026-08-01): the three model-facing provider roles (Ollama executor, Anthropic task-author, Anthropic reviewer), the two independent prompt templates, and the per-task budget ceiling. $0 real spend — every test uses scripted doubles or a mocked `@anthropic-ai/sdk`/`fetch`, no live Ollama or Anthropic call was made. See below for what exists and the judgment calls made.
+
+**Not yet built:** everything from Session 3 onward — the core loop (structural check, baseline test gate, step/task orchestration), git/PR integration, the GitHub Actions workflow, and the real end-to-end dry run. See "Remaining sessions" below for the full plan.
 
 **Session 0 (manual, not a Claude Code session):** the user is responsible for Acer machine bootstrap — headless Ubuntu, Node 20+, `git`/`gh` CLI, Ollama with `qwen2.5:3b` pulled, the private `Reeve` GitHub repo created, the Acer registered as a self-hosted Actions runner, a fine-grained PAT (`REEVE_TARGET_PAT`) scoped to target repos, and `ANTHROPIC_API_KEY`/`REEVE_TARGET_PAT`/`RESEND_API_KEY` stored as repo secrets. Session 1 assumes this is already done but does not depend on it (Session 1 has zero infra/network dependency).
 
@@ -22,16 +24,29 @@ Reeve is a Sonnet-supervised qwen task-execution loop: `qwen2.5:3b` (via Ollama)
 src/
   types.ts           TaskRecord, TaskStep, Attempt + status/kind/verdict unions,
                      StructuralCheckResult, TestGateResult
+  budget.ts           SONNET_MODEL, PRICING, computeCostUsd, TaskBudget
   db/
     migrations.ts     Migration type + migrate() runner (schema_migrations table,
                        apply-in-order, skip-already-applied, one transaction per migration)
     reeve-db.ts        ReeveDb class — all reads/writes against reeve.sqlite, newId()
+  providers/
+    executor.ts        Executor interface + OllamaExecutor + ScriptedExecutor
+    task-author.ts      TaskAuthor interface + AnthropicTaskAuthor + ScriptedTaskAuthor
+    reviewer.ts         Reviewer interface + AnthropicReviewer + ScriptedReviewer
+  prompts/
+    task-author-prompt.ts   Independent from reviewer-prompt.ts — no shared builder
+    reviewer-prompt.ts
 tests/
   db.test.ts          Migration cleanliness, task/step/attempt round-trips, no-op
                        re-migration on reopen
+  budget.test.ts       computeCostUsd pricing math, TaskBudget ceiling enforcement
+  providers/
+    executor.test.ts     OllamaExecutor real path (mocked fetch) + ScriptedExecutor
+    task-author.test.ts  AnthropicTaskAuthor (mocked @anthropic-ai/sdk) + ScriptedTaskAuthor
+    reviewer.test.ts     AnthropicReviewer (mocked @anthropic-ai/sdk) + ScriptedReviewer
 ```
 
-Everything else in `CONTEXT.md`'s architecture diagram (`providers/`, `prompts/`, `budget.ts`, `structural-check.ts`, `test-gate.ts`, `loop.ts`, `git.ts`, `pr.ts`, `notify.ts`, `cli.ts`, `.github/workflows/reeve.yml`) does not exist yet — built in Sessions 2–5.
+Everything else in `CONTEXT.md`'s architecture diagram (`structural-check.ts`, `test-gate.ts`, `loop.ts`, `git.ts`, `pr.ts`, `notify.ts`, `cli.ts`, `.github/workflows/reeve.yml`) does not exist yet — built in Sessions 3–5.
 
 ### Types (`src/types.ts`)
 
@@ -54,6 +69,21 @@ Everything else in `CONTEXT.md`'s architecture diagram (`providers/`, `prompts/`
 
 **Judgment call:** `reeve.sqlite`'s default path isn't decided yet — no `cli.ts` exists to have a default path. `ReeveDb`'s constructor just takes whatever path it's given (or `:memory:` for tests). Session 5 explicitly calls out verifying where a self-hosted runner can durably write between jobs before picking a real default path — deferring that choice to Session 5 rather than guessing now is intentional, not an oversight.
 
+### Budget (`src/budget.ts`)
+
+`SONNET_MODEL = "claude-sonnet-5"` (hardcoded per `CONTEXT.md`'s model-hardcoding decision — Reeve's own spec already names this exact model, so it's honored as-is rather than substituted). `PRICING` mirrors Drover's `src/actor/budget.ts` shape (`inputPerM`/`outputPerM`, `computeCostUsd` applying a 1.25× cache-write / 0.1× cache-read multiplier) — same list price Drover records for `claude-sonnet-5` ($3/$15 per M tokens), not the temporary 2026-08-31 introductory rate, since a hardcoded intro price would silently go stale once the promotion ends. `TaskBudget` differs from Drover's `SessionBudget` on purpose: Drover's is a soft per-persona-session cap checked after the fact (`exceeded` getter); Reeve's `assertCanCall()` is a hard pre-flight gate that throws `TaskBudgetExceededError` before a call that would cross the ceiling is ever made, per `CONTEXT.md`'s "checked before every Sonnet call, never mid-write."
+
+### Providers (`src/providers/`, `src/prompts/`)
+
+- **`executor.ts`** — `Executor.rewrite(instruction, currentFileContent)`. `OllamaExecutor` posts a plain `system`+`user` chat to `qwen2.5:3b` via Ollama's `/api/chat`, **no `tools` array** — the prompt asks qwen to return the complete new file content between literal `<<<REEVE_FILE_START>>>`/`<<<REEVE_FILE_END>>>` markers, and `parseRewrite()` extracts what's between them, throwing `MalformedRewriteError` if the markers are missing, out of order, or the extracted content is empty. `ScriptedExecutor` returns each entry of a string array in order, for loop tests in Session 3+.
+- **`task-author.ts`** — `TaskAuthor.decompose(taskDescription, targetRepo)`. `AnthropicTaskAuthor` forces a single `author_task` tool call (`tool_choice: {type: "tool", name: "author_task"}`) returning either `{escalate: false, steps: TaskStepDraft[]}` or `{escalate: true, reason}` — the pre-flight escalation path from `CONTEXT.md`. Cost is computed from `response.usage` **unconditionally, before parsing** the tool call, mirroring Drover's `MalformedDecisionError` precedent exactly: a malformed `author_task` payload still reports the billed usage on `MalformedTaskAuthorError.usage`, since the API call itself was charged regardless of whether the payload parsed.
+- **`reviewer.ts`** — `Reviewer.review(request)`, forcing a `submit_review` tool call returning `{verdict, reasoning, revisedInstruction?}` (`revisedInstruction` required only when `verdict === "revise"`). Same billed-usage-on-malformed-output pattern as the task-author (`MalformedReviewError`).
+- **`prompts/task-author-prompt.ts`** and **`prompts/reviewer-prompt.ts`** — two separate modules with no shared builder function, per `CONTEXT.md`'s prompt-separation decision. Each opens by telling Sonnet explicitly who it's writing for/judging (a 3B local executor with no judgment of its own) — the "upfront persona-priming" principle the validated 13-session manual run relied on. The reviewer prompt is built only from `{instruction, fileContentBefore, fileContentAfter, structuralCheckResult?, testGateResult?}` — it never receives the task-author's decomposition rationale.
+
+**Judgment call:** the reviewer prompt shows the executor's full before/after file content, labeled, rather than a computed unified diff — `CONTEXT.md` says the reviewer sees "the atomic instruction + qwen's diff," but Session 2 is provider-interfaces-only and a real diff (via `git diff` against an actual repo) doesn't exist until there's a real git working tree to diff, which is Session 3/4 territory. Full before/after content is a reasonable Session 2 stand-in — Sonnet can compare two blocks of text itself — and avoids pulling in a diff library or git dependency prematurely. Revisit once `git.ts` (Session 4) or the structural-check/test-gate modules (Session 3) give the loop something real to diff.
+
+**Judgment call:** `AnthropicTaskAuthor`/`AnthropicReviewer` construct their own `Anthropic()` client per instance (matching Drover's `AnthropicModelProvider` pattern) rather than accepting an injected client — tests mock the whole `@anthropic-ai/sdk` module (same technique as Drover's `tests/actor/provider.test.ts`: `messages` is an instance property set in the constructor, not a prototype getter, so it can't be spied on after construction).
+
 ---
 
 ## Tooling (as built)
@@ -61,9 +91,9 @@ Everything else in `CONTEXT.md`'s architecture diagram (`providers/`, `prompts/`
 - **TypeScript**: strict, ESM (`NodeNext`), `noUncheckedIndexedAccess`, `noImplicitOverride`, `exactOptionalPropertyTypes` — mirrors Drover's `tsconfig.json` exactly. `tsconfig.typecheck.json` extends it with `noEmit` + includes `tests`/`scripts` for `npm run typecheck`.
 - **Biome**: `files.includes` covers `src/**`, `tests/**`, `scripts/**` from the very start — Drover hit a real bug once from forgetting `scripts/**` (see this file's history once `DROVER.md` exists), so it's included here even though `scripts/` doesn't exist yet.
 - **vitest**: `npm test` runs `vitest run`. No `vitest.config.ts` — defaults are sufficient, same as Drover.
-- **better-sqlite3**: only runtime dependency so far. `@anthropic-ai/sdk` and everything else in `CONTEXT.md`'s stack list is deliberately not installed yet — added when Session 2 actually needs it, not preemptively.
+- **better-sqlite3**, **@anthropic-ai/sdk**: the two runtime dependencies so far. Everything else in `CONTEXT.md`'s stack list (`commander`, `dotenv`, etc.) is deliberately not installed yet — added when a later session actually needs it, not preemptively.
 
-Verified clean as of Session 1: `npm run typecheck`, `npm test` (11/11 passing), `npm run lint`.
+Verified clean as of Session 2: `npm run typecheck`, `npm test` (42/42 passing), `npm run lint` (0 warnings).
 
 ---
 
@@ -87,21 +117,7 @@ Verified clean as of Session 1: `npm run typecheck`, `npm test` (11/11 passing),
 
 Ported verbatim from `REEVE.md` so this plan survives that file's deletion. Read `CONTEXT.md` in full before starting any of these — several reference decisions made earlier. Do not commit at the end of a session (report a commit message for the user to run by hand) and do not start the next session in the same sitting.
 
-### Session 2 — Model provider layer: Ollama executor + Anthropic task-author/reviewer
-
-**Cost: $0 real spend** — every test uses scripted doubles; a real Ollama call is $0 regardless since it's local.
-
-1. `Executor` interface (`rewrite(instruction, currentFileContent): Promise<{ newContent: string }>`) + `OllamaExecutor` (calls qwen2.5:3b's `/api/chat`, plain system+user prompt, **no tools array** — parses the returned content between explicit markers the prompt asks it to use) + `ScriptedExecutor`.
-2. `TaskAuthor` interface + `AnthropicTaskAuthor` (forced structured tool-call output: either `{ steps: TaskStep[] }` or `{ escalate: true, reason: string }` for the pre-flight guard) + `ScriptedTaskAuthor`.
-3. `Reviewer` interface + `AnthropicReviewer` (forced structured tool-call output: `{ verdict: "pass"|"revise"|"escalate", reasoning: string, revisedInstruction?: string }`) + `ScriptedReviewer`. Its prompt is written and templated **completely independently** from the task-author's.
-4. Two independent prompt templates, each explicitly primed for its actual audience.
-5. `TaskBudget` — mirrors Drover's `SessionBudget` shape: a running total, `assertCanCall()` checked before every Sonnet call, throwing/escalating once the per-task dollar ceiling would be exceeded.
-6. Hardcode `OLLAMA_MODEL = "qwen2.5:3b"` and `SONNET_MODEL = "claude-sonnet-5"` as named constants — not config.
-7. Tests: each provider's real-vs-scripted paths, malformed-output handling, budget ceiling enforcement.
-
-**Stop condition:** all three provider roles work in isolation against scripted doubles; budget ceiling proven. No orchestration loop, no git, no CLI yet.
-
-**Commit message:** `Reeve Session 2 — Ollama executor + Anthropic task-author/reviewer providers, budget ceiling`
+Session 2 (model provider layer) is done — see "Build status" and the "Providers" / "Budget" sections above for what actually got built and the judgment calls made.
 
 ### Session 3 — Core loop: structural check, baseline-diff test gate, step/task orchestration
 
