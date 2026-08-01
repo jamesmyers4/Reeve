@@ -48,6 +48,17 @@ export interface RunTaskInput {
   targetRepo: string;
 }
 
+/**
+ * `TaskRecord` plus the task-author's stated reason for a pre-flight
+ * escalation — kept off the persisted schema (there's no step for it to
+ * attach to; a pre-flight escalation happens before any step exists) but
+ * surfaced here since deliver.ts's escalation email needs it and has no
+ * other way to reach it once `runTask()` returns.
+ */
+export interface RunTaskResult extends TaskRecord {
+  preflightReason?: string;
+}
+
 function recordAttempt(
   db: ReeveDb,
   stepId: string,
@@ -183,7 +194,7 @@ async function runStep(
   return finalStatus;
 }
 
-export async function runTask(input: RunTaskInput, ctx: RunTaskContext): Promise<TaskRecord> {
+export async function runTask(input: RunTaskInput, ctx: RunTaskContext): Promise<RunTaskResult> {
   const task: TaskRecord = {
     id: newId(),
     description: input.description,
@@ -201,7 +212,7 @@ export async function runTask(input: RunTaskInput, ctx: RunTaskContext): Promise
   if (decomposeOutcome.result.escalate) {
     const status: TaskStatus = "escalated-preflight";
     ctx.db.updateTaskStatus(task.id, status);
-    return { ...task, status };
+    return { ...task, status, preflightReason: decomposeOutcome.result.reason };
   }
 
   const baseline = ctx.testCommand ? captureTestBaseline(ctx.testCommand, ctx.repoRoot) : undefined;

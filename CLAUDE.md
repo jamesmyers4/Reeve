@@ -12,9 +12,11 @@ Reeve is a Sonnet-supervised qwen task-execution loop: `qwen2.5:3b` (via Ollama)
 
 **Session 2 — done** (2026-08-01): the three model-facing provider roles (Ollama executor, Anthropic task-author, Anthropic reviewer), the two independent prompt templates, and the per-task budget ceiling. $0 real spend — every test uses scripted doubles or a mocked `@anthropic-ai/sdk`/`fetch`, no live Ollama or Anthropic call was made.
 
-**Session 3 — done** (2026-08-01): the actual decompose → execute → gate → review → revise/pass/escalate loop (`runTask()`/`runStep()`), the structural-check guard (real `tsc`/`node --check`/`python -m py_compile` subprocess invocations), the baseline-diff test gate, and a real throwaway-git-repo test fixture. $0 cost — all tests run against scripted providers + the fixture repo; structural-check's own tests are the one place real subprocesses (a real `tsc`, a real `node --check`) actually run, since that module's whole job is shelling out. See below for what exists and the judgment calls made.
+**Session 3 — done** (2026-08-01): the actual decompose → execute → gate → review → revise/pass/escalate loop (`runTask()`/`runStep()`), the structural-check guard (real `tsc`/`node --check`/`python -m py_compile` subprocess invocations), the baseline-diff test gate, and a real throwaway-git-repo test fixture. $0 cost — all tests run against scripted providers + the fixture repo; structural-check's own tests are the one place real subprocesses (a real `tsc`, a real `node --check`) actually run, since that module's whole job is shelling out.
 
-**Not yet built:** everything from Session 4 onward — git/PR integration, the GitHub Actions workflow, and the real end-to-end dry run. See "Remaining sessions" below for the full plan.
+**Session 4 — done** (2026-08-01): a thin `git` shell wrapper (branch/commit/push over an authenticated HTTPS URL), a `gh pr create` wrapper (ready-for-review vs. draft), two Resend email templates, and `deliver.ts` — the composition layer that turns a `runTask()` result into a real branch/PR/email per end state. $0 cost — all tests mock `node:child_process` and the `resend` module. See below for what exists and the judgment calls made.
+
+**Not yet built:** everything from Session 5 onward — the GitHub Actions workflow and the real end-to-end dry run (the first session to spend real money). See "Remaining sessions" below for the full plan.
 
 **Session 0 (manual, not a Claude Code session):** the user is responsible for Acer machine bootstrap — headless Ubuntu, Node 20+, `git`/`gh` CLI, Ollama with `qwen2.5:3b` pulled, the private `Reeve` GitHub repo created, the Acer registered as a self-hosted Actions runner, a fine-grained PAT (`REEVE_TARGET_PAT`) scoped to target repos, and `ANTHROPIC_API_KEY`/`REEVE_TARGET_PAT`/`RESEND_API_KEY` stored as repo secrets. Session 1 assumes this is already done but does not depend on it (Session 1 has zero infra/network dependency).
 
@@ -42,6 +44,10 @@ src/
                        subprocess invocation, skipped silently for unknown extensions
   test-gate.ts         Baseline capture (once per task) + post-edit regression diff
   loop.ts              runStep() (attempt loop, max 3) + runTask() (decompose -> steps -> outcome)
+  git.ts               Branch creation, per-step commits, push via the cross-repo PAT
+  pr.ts                gh pr create wrapper — ready-for-review vs. draft, per-outcome description
+  notify.ts            Two Resend email templates (escalation vs. final-pass)
+  deliver.ts           Composes git.ts+pr.ts+notify.ts into one runTask()-result -> branch/PR/email call
 tests/
   db.test.ts          Migration cleanliness, task/step/attempt round-trips, no-op
                        re-migration on reopen
@@ -50,6 +56,11 @@ tests/
   test-gate.test.ts    Baseline/regression diffing against a fake test-runner script
   loop.test.ts         Full pass, one-revision pass, 3-attempt escalation (no rollback of
                        earlier passed steps), pre-flight escalation, test-gate-forced revise
+  git.test.ts           Branch-name slugification, git wrappers (mocked child_process), PAT redaction
+  pr.test.ts            gh pr create wrapper (mocked child_process), draft flag, URL extraction
+  notify.test.ts        Pure email-template builders + sendEmail (mocked resend, no-key no-op)
+  deliver.test.ts       Integration: all 3 end states -> right branch/draft-state/email (mocked
+                        child_process + resend)
   providers/
     executor.test.ts     OllamaExecutor real path (mocked fetch) + ScriptedExecutor
     task-author.test.ts  AnthropicTaskAuthor (mocked @anthropic-ai/sdk) + ScriptedTaskAuthor
@@ -59,7 +70,7 @@ tests/
                           git init, seed files), mirrors Drover's tests/fixtures/site.ts
 ```
 
-Everything else in `CONTEXT.md`'s architecture diagram (`git.ts`, `pr.ts`, `notify.ts`, `cli.ts`, `.github/workflows/reeve.yml`) does not exist yet — built in Sessions 4–5.
+Everything else in `CONTEXT.md`'s architecture diagram (`cli.ts`, `.github/workflows/reeve.yml`) does not exist yet — built in Session 5.
 
 ### Types (`src/types.ts`)
 
@@ -123,6 +134,38 @@ Everything else in `CONTEXT.md`'s architecture diagram (`git.ts`, `pr.ts`, `noti
 
 **Judgment call — budget-exceeded is a thrown error, not a `TaskStatus`:** `TaskBudget.assertCanCall()` throws `TaskBudgetExceededError` before the task-author call and before every review call, per `CONTEXT.md`. Session 3 lets that exception propagate out of `runTask()`/`runStep()` rather than mapping it onto some `TaskStatus` value — the Session 1 schema has no field to record *why* a task never got as far as decomposing (a pre-flight escalation's reason lives in the task-author's own response; there's no equivalent slot for "the budget ran out before we could even ask"). Session 5's CLI wiring is the natural place to decide how a thrown budget error becomes a real escalation email/PR state; forcing that decision now would be scope creep against a schema that isn't built for it yet.
 
+**Retroactive amendment in Session 4 — `loop.ts`'s `runTask()` now returns `RunTaskResult` (`TaskRecord & { preflightReason?: string }`), not a bare `TaskRecord`.** Session 4's escalation email for a pre-flight escalation needs the task-author's stated reason, per `CONTEXT.md` ("pre-flight escalation... email only, just the task-author's stated reason"), and there is genuinely nowhere in the Session 1 schema to persist it (no step exists yet for a pre-flight escalation to attach an `Attempt` to). Rather than force a schema migration for a value that's only ever needed in-memory, `preflightReason` rides along on the object `runTask()` already returns — never written to `reeve.sqlite`. `loop.test.ts`'s pre-flight test already covers the field being populated correctly.
+
+### Git (`src/git.ts`)
+
+`branchNameForTask(task)` builds `qwen-task/<first-8-chars-of-task-id>-<slugified-description>` (slug capped at 40 chars, falls back to the literal string `"task"` if the description has no sluggable characters at all). `createTaskBranch`/`commitStep`/`pushTaskBranch`/`currentCommitSha`/`diffStat` are thin `execFileSync("git", [...])` wrappers.
+
+**Judgment call — `execFileSync` with array args, never `spawnSync(..., {shell: true})`:** a commit message is `TaskStep.instruction` — Sonnet-authored text that Reeve doesn't fully control the shape of. Passing it as a single argv entry via `execFileSync` means it's never interpreted by a shell, regardless of what characters it contains. This is a deliberate departure from `test-gate.ts`'s `spawnSync(..., {shell: true})` pattern (Session 3) — that call's `test_command` is a trusted, user-supplied config value, not model output, so shell interpretation there is intentional (`test_command` needs to support pipes/redirects/etc.); a commit message never does.
+
+**Judgment call — PAT redaction in thrown errors.** `pushTaskBranch` authenticates via a one-off `https://x-access-token:<pat>@github.com/<repo>.git` URL (never written into the repo's own git config) and passes the PAT to `runGit`'s `secretToRedact` parameter, which scrubs every occurrence of the literal PAT string from the thrown `GitCommandError`'s `command`/`stderr`/`message` before it's ever constructed — defense in depth on top of git's own credential redaction, in case a future git version or code path doesn't redact it. Verified directly in `git.test.ts` by forcing a failure whose stderr embeds the PAT and asserting it never survives into the error.
+
+### PR (`src/pr.ts`)
+
+`createPr()` shells out to `gh pr create --repo <targetRepo> --head <branchName> --title <title> --body <body>` (`+ --draft` when not a full pass) and extracts the created PR's URL from the last non-empty line of `gh`'s stdout — `gh pr create`'s documented behavior. A `gh` invocation that succeeds but somehow prints no URL is treated as a real error (`GhCommandError`), not a silent `{url: ""}`.
+
+### Notify (`src/notify.ts`)
+
+Mirrors the user's existing `volunteer-ops/src/lib/email.ts` Resend pattern exactly (found by searching the user's other repos for prior art rather than inventing a new convention): `RESEND_API_KEY` env var, a null-guarded client that logs a warning and no-ops rather than throwing when the key is unset, and a send wrapped in try/catch that logs and swallows any failure — notification delivery is best-effort, and a flaky Resend call must never fail the task itself. `REEVE_EMAIL_FROM` (optional, defaults to `"Reeve <onboarding@resend.dev>"`) is a new env var this convention needed that Session 0's checklist didn't anticipate — add it alongside `RESEND_API_KEY` when setting up secrets for real (Session 5).
+
+The two template builders (`buildFinalPassEmail`, `buildEscalationEmail`) are pure functions with no env dependency — only `sendEmail` itself touches the Resend SDK — so the templates' content is tested without mocking anything.
+
+### Deliver (`src/deliver.ts`)
+
+**Judgment call — a file not named in `CONTEXT.md`'s architecture diagram.** That diagram lists only `git.ts`/`pr.ts`/`notify.ts`; Session 5's plan describes `cli.ts` as calling "Session 4's git/PR/notify code with the result." Composing three independent primitives into one coherent "turn this task outcome into a branch/PR/email" operation is Session 4's actual stated goal, and doing that composition here — tested against all three end states — means Session 5's `cli.ts` calls one proven function instead of re-deriving this logic inline. `deliverTaskOutcome(task, ctx)` is the single entry point:
+
+- `escalated-preflight` → **no git or `gh` call at all** — only the escalation email, with `task.preflightReason` as the reason and no PR link.
+- `passed` → branch created off current HEAD, one commit per passed step (in order), pushed, a ready-for-review PR (description includes every step + a real `git diff --stat` summary since the branch point), then the final-pass email linking it.
+- `escalated` → same branch/commit/push mechanism, but **only steps with `status: "passed"` are committed** — the escalated step's own edit was already reverted by `loop.ts` — then `gh pr create --draft`, whose description lists the safe (passed) steps separately from the escalated step's diagnostic summary, then the escalation email linking the draft PR.
+
+**Judgment call — only the *last* attempt is summarized in escalation output**, not the step's whole attempt history, per `CONTEXT.md`'s literal wording ("its last attempt's reasoning + test/structural output verbatim"). `deliver.test.ts`'s step-escalation case asserts this explicitly: an earlier attempt's reasoning text is asserted **absent** from the PR body, while the final attempt's is present.
+
+**Judgment call — a step-escalation with zero passed steps still gets a branch and a draft PR** (an empty diff, since nothing ever committed). `CONTEXT.md`'s distinction is "step-escalation (real work happened)" vs. "pre-flight escalation (nothing executed)" — the former maps to `TaskStatus === "escalated"` regardless of whether any individual step passed before the escalating one, so even a first-step-immediately-escalates task gets the same mechanism, with a description explaining what was attempted and why. An empty-diff draft PR is still a meaningful diagnostic artifact, not wasted output.
+
 ---
 
 ## Tooling (as built)
@@ -130,9 +173,9 @@ Everything else in `CONTEXT.md`'s architecture diagram (`git.ts`, `pr.ts`, `noti
 - **TypeScript**: strict, ESM (`NodeNext`), `noUncheckedIndexedAccess`, `noImplicitOverride`, `exactOptionalPropertyTypes` — mirrors Drover's `tsconfig.json` exactly. `tsconfig.typecheck.json` extends it with `noEmit` + includes `tests`/`scripts` for `npm run typecheck`.
 - **Biome**: `files.includes` covers `src/**`, `tests/**`, `scripts/**` from the very start — Drover hit a real bug once from forgetting `scripts/**` (see this file's history once `DROVER.md` exists), so it's included here even though `scripts/` doesn't exist yet.
 - **vitest**: `npm test` runs `vitest run`. No `vitest.config.ts` — defaults are sufficient, same as Drover.
-- **better-sqlite3**, **@anthropic-ai/sdk**: the two runtime dependencies so far. Everything else in `CONTEXT.md`'s stack list (`commander`, `dotenv`, etc.) is deliberately not installed yet — added when a later session actually needs it, not preemptively.
+- **better-sqlite3**, **@anthropic-ai/sdk**, **resend**: the three runtime dependencies so far. Everything else in `CONTEXT.md`'s stack list (`commander`, `dotenv`, etc.) is deliberately not installed yet — added when a later session actually needs it, not preemptively.
 
-Verified clean as of Session 3: `npm run typecheck`, `npm test` (61/61 passing), `npm run lint` (0 warnings). No new runtime dependencies — `structural-check.ts`/`test-gate.ts`/`loop.ts` and their tests use only `node:child_process`/`node:fs`/`node:path` and the two providers already installed.
+Verified clean as of Session 4: `npm run typecheck`, `npm test` (86/86 passing), `npm run lint` (0 warnings). `git.ts`/`pr.ts` use only `node:child_process`; `notify.ts` is the one new dependency (`resend`).
 
 ---
 
@@ -156,20 +199,7 @@ Verified clean as of Session 3: `npm run typecheck`, `npm test` (61/61 passing),
 
 Ported verbatim from `REEVE.md` so this plan survives that file's deletion. Read `CONTEXT.md` in full before starting any of these — several reference decisions made earlier. Do not commit at the end of a session (report a commit message for the user to run by hand) and do not start the next session in the same sitting.
 
-Sessions 2 (model provider layer) and 3 (core loop) are done — see "Build status" and the "Providers" / "Budget" / "Structural check" / "Test gate" / "Loop" sections above for what actually got built and the judgment calls made.
-
-### Session 4 — Git/PR integration + notifications
-
-**Cost: $0 for tests** (mocked `git`/`gh`/Resend calls).
-
-1. Thin wrapper around shell `git`: create `qwen-task/<id>-<slug>` off the target repo's default branch, one commit per `passed` step (message = that step's instruction), push using the cross-repo PAT over HTTPS.
-2. Wraps `gh pr create`: full pass → PR ready for review, description lists every step + instruction + final diff summary. Step-escalation → same call with `--draft`, description explains passed-vs-escalated steps with the last attempt's reasoning + test/structural output verbatim. Pre-flight escalation → no git/PR call at all.
-3. Two Resend email templates (escalation, final-pass) reusing the existing Resend client/from-address pattern. Escalation template covers both step-escalation (links draft PR) and pre-flight escalation (no PR link, just the task-author's stated reason). Final-pass template links the ready PR.
-4. Tests: mock `git`/`gh` child-process calls and the Resend client; assert branch name, draft-vs-ready state, description content, and correct email template per end state.
-
-**Stop condition:** given a `runTask()` result, the right branch/PR/draft-state/email fires, proven via mocks — no real GitHub/Resend call yet.
-
-**Commit message:** `Reeve Session 4 — branch/PR creation and Resend escalation/final-pass notifications`
+Sessions 2 (model provider layer), 3 (core loop), and 4 (git/PR/notify) are done — see "Build status" and the sections above for what actually got built and the judgment calls made.
 
 ### Session 5 — GitHub Actions workflow + real end-to-end dry run
 

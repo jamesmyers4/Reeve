@@ -31,7 +31,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
-    "better-sqlite3": "^13.0.2"
+    "better-sqlite3": "^13.0.2",
+    "resend": "^6.18.1"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.6",
